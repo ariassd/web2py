@@ -26,6 +26,14 @@ Typical usage:
     def delete_sessions():
         single_loop(auth.settings.expiration)
 
+Command lines options specific to session2trash.py:
+NOTE: They should be preceeded by web2py command line option "-A" to be passed to script.
+
+-f, --force : Ignore session expiration. Force expiry based on -x option or auth.settings.expiration.
+-o, --once : Delete sessions, then exit. Essential when trigger trash sessions from system CRON JOB
+-s, --sleep : Number of seconds to sleep between executions. Default 300.
+-v, --verbose : print verbose output, a second -v increases verbosity
+-x, --expiration : Expiration value for sessions without expiration (in seconds)
 """
 
 from __future__ import with_statement
@@ -33,7 +41,7 @@ from __future__ import with_statement
 from gluon import current
 from gluon.storage import Storage
 from gluon._compat import pickle
-from optparse import OptionParser
+
 import datetime
 import stat
 import time
@@ -54,13 +62,12 @@ class SessionSet(object):
 
     def get(self):
         """Get session files/records."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def trash(self):
         """Trash expired sessions."""
         now = datetime.datetime.now()
         for item in self.get():
-            status = 'OK'
             last_visit = item.last_visit_default()
 
             try:
@@ -80,16 +87,18 @@ class SessionSet(object):
             if age > self.expiration or not self.expiration:
                 item.delete()
                 status = 'trashed'
+            else:
+                status = 'OK'
 
             if self.verbose > 1:
-                print('key: %s' % str(item))
+                print('key: %s' % item)
                 print('expiration: %s seconds' % self.expiration)
-                print('last visit: %s' % str(last_visit))
+                print('last visit: %s' % last_visit)
                 print('age: %s seconds' % age)
                 print('status: %s' % status)
                 print('')
             elif self.verbose > 0:
-                print('%s %s' % (str(item), status))
+                print('%s %s' % (item, status))
 
 
 class SessionSetDb(SessionSet):
@@ -171,8 +180,8 @@ class SessionFile(object):
 
     def get(self):
         session = Storage()
-        with open(self.filename, 'rb+') as f:
-            session.update(cPickle.load(f))
+        with open(self.filename, 'rb') as f:
+            session.update(pickle.load(f))
         return session
 
     def last_visit_default(self):
@@ -190,8 +199,7 @@ def total_seconds(delta):
     Args:
         delta: datetime.timedelta instance.
     """
-    return (delta.microseconds + (delta.seconds + (delta.days * 24 * 3600)) *
-            10 ** 6) / 10 ** 6
+    return (delta.microseconds + (delta.seconds + (delta.days * 86400)) * 1000000) / 1e6
 
 def single_loop(expiration=None, force=False, verbose=False):
     if expiration is None:
@@ -208,9 +216,9 @@ def single_loop(expiration=None, force=False, verbose=False):
 
 def main():
     """Main processing."""
+    from optparse import OptionParser
 
-    usage = '%prog [options]' + '\nVersion: %s' % VERSION
-    parser = OptionParser(usage=usage)
+    parser = OptionParser(usage="%%prog [options]\nVersion: %s" % VERSION)
 
     parser.add_option('-f', '--force',
                       action='store_true', dest='force', default=False,

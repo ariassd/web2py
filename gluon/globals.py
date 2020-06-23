@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
@@ -14,7 +13,7 @@ Contains the classes for the global used variables:
 
 """
 from gluon._compat import pickle, StringIO, copyreg, Cookie, urlparse, PY2, iteritems, to_unicode, to_native, \
-    unicodeT, long, hashlib_md5, urllib_quote
+    to_bytes, unicodeT, long, hashlib_md5, urllib_quote, to_native
 from gluon.storage import Storage, List
 from gluon.streamer import streamer, stream_file_or_304_or_206, DEFAULT_CHUNK_SIZE
 from gluon.contenttype import contenttype
@@ -27,7 +26,6 @@ from gluon.utils import web2py_uuid, secure_dumps, secure_loads
 from gluon.settings import global_settings
 from gluon import recfile
 from gluon.cache import CacheInRam
-from gluon.fileutils import copystream
 import hashlib
 from pydal.contrib import portalocker
 from pickle import Pickler, MARK, DICT, EMPTY_DICT
@@ -55,8 +53,6 @@ try:
 except ImportError:
     have_minify = False
 
-
-regex_session_id = re.compile('^([\w\-]+/)?[\w\-\.]+$')
 
 __all__ = ['Request', 'Response', 'Session']
 
@@ -105,6 +101,26 @@ def sorting_dumps(obj, protocol=None):
 # END #####################################################################
 
 
+def copystream(src, dest, size, chunk_size, cache_inc=None):
+    while size > 0:
+        if size < chunk_size:
+            data = src.read(size)
+            callable(cache_inc) and cache_inc(size)
+        else:
+            data = src.read(chunk_size)
+            callable(cache_inc) and cache_inc(chunk_size)
+        length = len(data)
+        if length > size:
+            (data, length) = (data[:size], size)
+        size -= length
+        if length == 0:
+            break
+        dest.write(data)
+        if length < chunk_size:
+            break
+    dest.seek(0)
+    return
+
 def copystream_progress(request, chunk_size=10 ** 5):
     """
     Copies request.env.wsgi_input into request.body
@@ -130,23 +146,8 @@ def copystream_progress(request, chunk_size=10 ** 5):
     cache_ram = CacheInRam(request)  # same as cache.ram because meta_storage
     cache_ram(cache_key + ':length', lambda: size, 0)
     cache_ram(cache_key + ':uploaded', lambda: 0, 0)
-    while size > 0:
-        if size < chunk_size:
-            data = source.read(size)
-            cache_ram.increment(cache_key + ':uploaded', size)
-        else:
-            data = source.read(chunk_size)
-            cache_ram.increment(cache_key + ':uploaded', chunk_size)
-        length = len(data)
-        if length > size:
-            (data, length) = (data[:size], size)
-        size -= length
-        if length == 0:
-            break
-        dest.write(data)
-        if length < chunk_size:
-            break
-    dest.seek(0)
+    copystream(source, dest, size, chunk_size,
+               lambda v : cache_ram.increment(cache_key + ':uploaded', v))
     cache_ram(cache_key + ':length', None)
     cache_ram(cache_key + ':uploaded', None)
     return dest
@@ -165,6 +166,7 @@ class Request(Storage):
     - folder
     - application
     - function
+    - method
     - args
     - extension
     - now: datetime.datetime.now()
@@ -180,6 +182,7 @@ class Request(Storage):
         self.env.web2py_path = global_settings.applications_parent
         self.env.update(global_settings)
         self.cookies = Cookie.SimpleCookie()
+        self.method = self.env.get('REQUEST_METHOD')
         self._get_vars = None
         self._post_vars = None
         self._vars = None
@@ -225,7 +228,7 @@ class Request(Storage):
                 # instead of load.
                 # This line can be simplified to json_vars = json_parser.load(body)
                 # if and when we drop support for python versions under 3.6
-                json_vars = json_parser.loads(to_native(body.read())) 
+                json_vars = json_parser.loads(to_native(body.read()))
             except:
                 # incoherent request bodies can still be parsed "ad-hoc"
                 json_vars = {}
@@ -239,7 +242,15 @@ class Request(Storage):
         # parse POST variables on POST, PUT, BOTH only in post_vars
         if body and not is_json and env.request_method in ('POST', 'PUT', 'DELETE', 'BOTH'):
             query_string = env.pop('QUERY_STRING', None)
-            dpost = cgi.FieldStorage(fp=body, environ=env, keep_blank_values=1)
+            content_disposition = env.get('HTTP_CONTENT_DISPOSITION')
+            if content_disposition:
+                headers = {'content-disposition': content_disposition,
+                           'content-type': env['CONTENT_TYPE'],
+                           'content-length': env['CONTENT_LENGTH'],
+                           }
+            else:
+                headers = None
+            dpost = cgi.FieldStorage(fp=body, environ=env, headers=headers, keep_blank_values=1)
             try:
                 post_vars.update(dpost)
             except:
@@ -344,8 +355,8 @@ class Request(Storage):
         user_agent = Storage(user_agent)
         user_agent.is_mobile = 'Mobile' in http_user_agent
         user_agent.is_tablet = 'Tablet' in http_user_agent
-        session._user_agent = user_agent 
-        
+        session._user_agent = user_agent
+
         return user_agent
 
     def requires_https(self):
@@ -355,9 +366,9 @@ class Request(Storage):
         """
         cmd_opts = global_settings.cmd_options
         # checking if this is called within the scheduler or within the shell
-        # in addition to checking if it's not a cronjob
-        if ((cmd_opts and (cmd_opts.shell or cmd_opts.scheduler))
-                or global_settings.cronjob or self.is_https):
+        # in addition to checking if it's a cron job
+        if (self.is_https or self.is_scheduler or cmd_opts and (
+                cmd_opts.shell or cmd_opts.cron_job)):
             current.session.secure()
         else:
             current.session.forget()
@@ -485,12 +496,12 @@ class Response(Storage):
         #
         # We will only minify and concat adjacent internal files as there's
         # no way to know if changing the order with which the files are apppended
-        # will break things since the order matters in both CSS and JS and 
+        # will break things since the order matters in both CSS and JS and
         # internal files may be interleaved with external ones.
         files = []
         # For the adjacent list we're going to use storage List to both distinguish
         # from the regular list and so we can add attributes
-        internal = List()  
+        internal = List()
         internal.has_js = False
         internal.has_css = False
         done = set() # to remove duplicates
@@ -513,7 +524,7 @@ class Response(Storage):
             if item.endswith('.js'):
                 internal.has_js = True
             if item.endswith('.css'):
-                internal.has_css = True            
+                internal.has_css = True
         if internal:
             files.append(internal)
 
@@ -537,7 +548,7 @@ class Response(Storage):
                                             time_expire)
                     else:
                         files[i] = call_minify()
-        
+
         def static_map(s, item):
             if isinstance(item, str):
                 f = item.lower().split('?')[0]
@@ -600,12 +611,13 @@ class Response(Storage):
         # for attachment settings and backward compatibility
         keys = [item.lower() for item in headers]
         if attachment:
+            # FIXME: should be done like in next download method
             if filename is None:
                 attname = ""
             else:
                 attname = filename
             headers["Content-Disposition"] = \
-                'attachment;filename="%s"' % attname
+                'attachment; filename="%s"' % attname
 
         if not request:
             request = current.request
@@ -652,6 +664,7 @@ class Response(Storage):
 
         Downloads from http://..../download/filename
         """
+        from pydal.helpers.regex import REGEX_UPLOAD_PATTERN
         from pydal.exceptions import NotAuthorizedException, NotFoundException
 
         current.session.forget(current.response)
@@ -659,13 +672,13 @@ class Response(Storage):
         if not request.args:
             raise HTTP(404)
         name = request.args[-1]
-        items = re.compile('(?P<table>.*?)\.(?P<field>.*?)\..*').match(name)
+        items = re.match(REGEX_UPLOAD_PATTERN, name)
         if not items:
             raise HTTP(404)
-        (t, f) = (items.group('table'), items.group('field'))
+        t = items.group('table'); f = items.group('field')
         try:
             field = db[t][f]
-        except AttributeError:
+        except (AttributeError, KeyError):
             raise HTTP(404)
         try:
             (filename, stream) = field.retrieve(name, nameonly=True)
@@ -686,7 +699,7 @@ class Response(Storage):
                 download_filename = download_filename.encode('utf-8')
             download_filename = urllib_quote(download_filename)
             headers['Content-Disposition'] = \
-                'attachment; filename="%s"' % download_filename.replace('"', '\"')
+                'attachment; filename="%s"' % download_filename.replace('"', '\\"')
         return self.stream(stream, chunk_size=chunk_size, request=request)
 
     def json(self, data, default=None, indent=None):
@@ -799,6 +812,8 @@ class Session(Storage):
     - session_filename
     """
 
+    REGEX_SESSION_FILE = r'^(?:[\w-]+/)?[\w.-]+$'
+
     def connect(self,
                 request=None,
                 response=None,
@@ -834,7 +849,6 @@ class Session(Storage):
             compression_level(int): 0-9, sets zlib compression on the data
                 before the encryption
         """
-        from gluon.dal import Field
         request = request or current.request
         response = response or current.response
         masterapp = masterapp or request.application
@@ -890,7 +904,7 @@ class Session(Storage):
             response.session_file = None
             # check if the session_id points to a valid sesion filename
             if response.session_id:
-                if not regex_session_id.match(response.session_id):
+                if not re.match(self.REGEX_SESSION_FILE, response.session_id):
                     response.session_id = None
                 else:
                     response.session_filename = \
@@ -925,7 +939,7 @@ class Session(Storage):
         elif response.session_storage_type == 'db':
             if global_settings.db_sessions is not True:
                 global_settings.db_sessions.add(masterapp)
-            # if had a session on file alreday, close it (yes, can happen)
+            # if had a session on file already, close it (yes, can happen)
             if response.session_file:
                 self._close(response)
             # if on GAE tickets go also in DB
@@ -937,7 +951,7 @@ class Session(Storage):
                 table_migrate = False
             tname = tablename + '_' + masterapp
             table = db.get(tname, None)
-            # Field = db.Field
+            Field = db.Field
             if table is None:
                 db.define_table(
                     tname,
@@ -967,9 +981,12 @@ class Session(Storage):
                     if row:
                         # rows[0].update_record(locked=True)
                         # Unpickle the data
-                        session_data = pickle.loads(row.session_data)
-                        self.update(session_data)
-                        response.session_new = False
+                        try:
+                            session_data = pickle.loads(row['session_data'])
+                            self.update(session_data)
+                            response.session_new = False
+                        except:
+                            record_id = None
                     else:
                         record_id = None
                 if record_id:
@@ -1049,7 +1066,7 @@ class Session(Storage):
             if record_id.isdigit() and long(record_id) > 0:
                 new_unique_key = web2py_uuid()
                 row = table(record_id)
-                if row and row.unique_key == unique_key:
+                if row and to_native(row['unique_key']) == to_native(unique_key):
                     table._db(table.id == record_id).update(unique_key=new_unique_key)
                 else:
                     record_id = None
@@ -1073,6 +1090,16 @@ class Session(Storage):
             scookies['HttpOnly'] = True
         if self._secure:
             scookies['secure'] = True
+        if self._same_site is None:
+            # Using SameSite Lax Mode is the default
+            # You actually have to call session.samesite(False) if you really
+            # dont want the extra protection provided by the SameSite header
+            self._same_site = 'Lax'
+        if self._same_site:
+            if 'samesite' not in Cookie.Morsel._reserved:
+                # Python version 3.7 and lower needs this
+                Cookie.Morsel._reserved['samesite'] = 'SameSite'
+            scookies['samesite'] = self._same_site
 
     def clear_session_cookies(self):
         request = current.request
@@ -1151,6 +1178,9 @@ class Session(Storage):
     def secure(self):
         self._secure = True
 
+    def samesite(self, mode='Lax'):
+        self._same_site = mode
+
     def forget(self, response=None):
         self._close(response)
         self._forget = True
@@ -1167,7 +1197,7 @@ class Session(Storage):
                              compression_level=compression_level)
         rcookies = response.cookies
         rcookies.pop(name, None)
-        rcookies[name] = value
+        rcookies[name] = to_native(value)
         rcookies[name]['path'] = '/'
         expires = response.session_cookie_expires
         if isinstance(expires, datetime.datetime):
@@ -1178,7 +1208,7 @@ class Session(Storage):
 
     def _unchanged(self, response):
         if response.session_new:
-            internal = ['_last_timestamp', '_secure', '_start_timestamp']
+            internal = ['_last_timestamp', '_secure', '_start_timestamp', '_same_site']
             for item in self.keys():
                 if item not in internal:
                     return False
@@ -1212,9 +1242,9 @@ class Session(Storage):
 
         session_pickled = response.session_pickled or pickle.dumps(self, pickle.HIGHEST_PROTOCOL)
 
-        dd = dict(locked=False,
+        dd = dict(locked=0,
                   client_ip=response.session_client,
-                  modified_datetime=request.now,
+                  modified_datetime=request.now.isoformat(),
                   session_data=session_pickled,
                   unique_key=unique_key)
         if record_id:

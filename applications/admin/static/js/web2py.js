@@ -284,6 +284,7 @@
                 var redirect = xhr.getResponseHeader('web2py-redirect-location');
                 if (redirect !== null) {
                     window.location = redirect;
+                    window.location.reload(); // Force reload even with anchors
                 }
                 /* run this here only if this Ajax request is NOT for a web2py component. */
                 if (xhr.getResponseHeader('web2py-component-content') === null) {
@@ -617,7 +618,7 @@
         flash: function (message, status) {
             var flash = $('.w2p_flash');
             web2py.hide_flash();
-            flash.html(message).addClass(status);
+            flash.text(message).addClass(status);
             if (flash.html()) flash.append('<span id="closeflash"> &times; </span>')[animateIn]();
         },
         hide_flash: function () {

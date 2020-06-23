@@ -15,7 +15,11 @@
 
 from __future__ import unicode_literals
 import sys
-if sys.version > '3':
+
+if sys.version_info[0] < 3:
+    is_py2 = True
+else:
+    is_py2 = False
     unicode = str
 
 
@@ -119,11 +123,11 @@ class SoapDispatcher(object):
             xml = xml.replace('/>', ' ' + _ns_str + '/>')
         return xml
 
-    def register_function(self, name, fn, returns=None, args=None, doc=None):
-        self.methods[name] = fn, returns, args, doc or getattr(fn, "__doc__", "")
+    def register_function(self, name, fn, returns=None, args=None, doc=None, response_element_name=None):
+        self.methods[name] = fn, returns, args, doc or getattr(fn, "__doc__", ""), response_element_name or '%sResponse' % name
 
     def response_element_name(self, method):
-        return '%sResponse' % method
+        return self.methods[method][4]
 
     def dispatch(self, xml, action=None, fault=None):
         """Receive and process SOAP call, returns the xml"""
@@ -160,7 +164,8 @@ class SoapDispatcher(object):
                     # Now we change 'external' and 'model' to the received forms i.e. 'ext' and 'mod'
                 # After that we know how the client has prefixed additional namespaces
 
-            ns = NS_RX.findall(xml)
+            decoded_xml = xml if is_py2 else xml.decode('utf8')
+            ns = NS_RX.findall(decoded_xml)
             for k, v in ns:
                 if v in self.namespaces.values():
                     _ns_reversed[v] = k
@@ -179,7 +184,7 @@ class SoapDispatcher(object):
                 prefix = method.get_prefix()
 
             log.debug('dispatch method: %s', name)
-            function, returns_types, args_types, doc = self.methods[name]
+            function, returns_types, args_types, doc, response_element_name = self.methods[name]
             log.debug('returns_types %s', returns_types)
 
             # de-serialize parameters (if type definitions given)
@@ -286,11 +291,11 @@ class SoapDispatcher(object):
 
     def list_methods(self):
         """Return a list of aregistered operations"""
-        return [(method, doc) for method, (function, returns, args, doc) in self.methods.items()]
+        return [(method, doc) for method, (function, returns, args, doc, response_element_name) in self.methods.items()]
 
     def help(self, method=None):
         """Generate sample request and response messages"""
-        (function, returns, args, doc) = self.methods[method]
+        (function, returns, args, doc, response_element_name) = self.methods[method]
         xml = """
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
 <soap:Body><%(method)s xmlns="%(namespace)s"/></soap:Body>
@@ -307,8 +312,8 @@ class SoapDispatcher(object):
 
         xml = """
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-<soap:Body><%(method)sResponse xmlns="%(namespace)s"/></soap:Body>
-</soap:Envelope>""" % {'method': method, 'namespace': self.namespace}
+<soap:Body><%(response_element_name)s xmlns="%(namespace)s"/></soap:Body>
+</soap:Envelope>""" % {'response_element_name': response_element_name, 'namespace': self.namespace}
         response = SimpleXMLElement(xml, namespace=self.namespace, prefix=self.prefix)
         if returns:
             items = returns.items()
@@ -317,7 +322,7 @@ class SoapDispatcher(object):
         else:
             items = []
         for k, v in items:
-            response('%sResponse' % method).marshall(k, v, add_comments=True, ns=False)
+            response(response_element_name).marshall(k, v, add_comments=True, ns=False)
 
         return request.as_xml(pretty=True), response.as_xml(pretty=True), doc
 
@@ -343,7 +348,7 @@ class SoapDispatcher(object):
 """ % {'namespace': self.namespace, 'name': self.name, 'documentation': self.documentation}
         wsdl = SimpleXMLElement(xml)
 
-        for method, (function, returns, args, doc) in self.methods.items():
+        for method, (function, returns, args, doc, response_element_name) in self.methods.items():
             # create elements:
 
             def parse_element(name, values, array=False, complex=False):
@@ -369,40 +374,40 @@ class SoapDispatcher(object):
                     e['name'] = k
                     if array:
                         e[:] = {'minOccurs': "0", 'maxOccurs': "unbounded"}
-                    if v in TYPE_MAP.keys():
-                        t = 'xsd:%s' % TYPE_MAP[v]
-                    elif v is None:
+                    if v is None:
                         t = 'xsd:anyType'
-                    elif isinstance(v, list):
+                    elif type(v) == list:
                         n = "ArrayOf%s%s" % (name, k)
                         l = []
                         for d in v:
                             l.extend(d.items())
                         parse_element(n, l, array=True, complex=True)
                         t = "tns:%s" % n
-                    elif isinstance(v, dict):
+                    elif type(v) == dict:
                         n = "%s%s" % (name, k)
                         parse_element(n, v.items(), complex=True)
                         t = "tns:%s" % n
+                    elif v in TYPE_MAP:
+                        t = 'xsd:%s' % TYPE_MAP[v]
                     else:
-                        raise TypeError("unknonw type %s for marshalling" % str(v))
+                        raise TypeError("unknown type %s for marshalling" % str(v))
                     e.add_attribute('type', t)
 
             parse_element("%s" % method, args and args.items())
-            parse_element("%sResponse" % method, returns and returns.items())
+            parse_element(response_element_name, returns and returns.items())
 
             # create messages:
-            for m, e in ('Input', ''), ('Output', 'Response'):
+            for m, e in ('Input', method), ('Output', response_element_name):
                 message = wsdl.add_child('wsdl:message')
                 message['name'] = "%s%s" % (method, m)
                 part = message.add_child("wsdl:part")
                 part[:] = {'name': 'parameters',
-                           'element': 'tns:%s%s' % (method, e)}
+                           'element': 'tns:%s' % e}
 
         # create ports
         portType = wsdl.add_child('wsdl:portType')
         portType['name'] = "%sPortType" % self.name
-        for method, (function, returns, args, doc) in self.methods.items():
+        for method, (function, returns, args, doc, response_element_name) in self.methods.items():
             op = portType.add_child('wsdl:operation')
             op['name'] = method
             if doc:
