@@ -13,6 +13,8 @@ Files added
     - runtime.txt
     - web.config
 
+Last update 2020-12-16
+
 To start
 1. Fork this repo (github)
 2. Configure continuous deployment using github https://azure.microsoft.com/en-us/documentation/articles/web-sites-publish-source-control/ 
